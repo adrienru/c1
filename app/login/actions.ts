@@ -1,7 +1,7 @@
 "use server"
 
 import bcrypt from "bcryptjs"
-import { supabase } from "@/lib/supabase"
+import { userOperations } from "@/lib/db-operations"
 import { createSession } from "@/lib/session"
 
 export async function signup(email: string, username: string, password: string) {
@@ -10,32 +10,33 @@ export async function signup(email: string, username: string, password: string) 
   }
 
   // Verificar si el email ya existe
-  const { data: existingEmailUser } = await supabase.from("users").select("id").eq("email", email).single()
+  const existingEmailUser = userOperations.findByEmail(email)
   if (existingEmailUser) {
     return { success: false, error: "El usuario con este correo ya existe." }
   }
 
   // Verificar si el nombre de usuario ya existe
-  const { data: existingUsernameUser } = await supabase.from("users").select("id").eq("username", username).single()
+  const existingUsernameUser = userOperations.findByUsername(username)
   if (existingUsernameUser) {
     return { success: false, error: "El nombre de usuario ya está en uso." }
   }
 
   const hashedPassword = await bcrypt.hash(password, 10)
 
-  const { data, error } = await supabase
-    .from("users")
-    .insert({ email, username, hashed_password: hashedPassword }) // Incluye el nombre de usuario
-    .select("id")
-    .single()
+  try {
+    const result = userOperations.create(email, username, hashedPassword)
+    const newUser = userOperations.findByEmail(email)
+    
+    if (!newUser) {
+      return { success: false, error: "Error al crear usuario." }
+    }
 
-  if (error) {
+    await createSession(newUser.id)
+    return { success: true }
+  } catch (error: any) {
     console.error("Error al registrar usuario:", error)
     return { success: false, error: error.message || "Error al registrar usuario." }
   }
-
-  await createSession(data.id)
-  return { success: true }
 }
 
 export async function login(identifier: string, password: string) {
@@ -44,23 +45,18 @@ export async function login(identifier: string, password: string) {
   }
 
   let user = null
-  let error = null
 
   // Intentar buscar por email
   if (identifier.includes("@")) {
-    const { data, error: emailError } = await supabase.from("users").select("*").eq("email", identifier).single()
-    user = data
-    error = emailError
+    user = userOperations.findByEmail(identifier)
   }
 
   // Si no se encontró por email o no era un email, intentar buscar por username
   if (!user) {
-    const { data, error: usernameError } = await supabase.from("users").select("*").eq("username", identifier).single()
-    user = data
-    error = usernameError
+    user = userOperations.findByUsername(identifier)
   }
 
-  if (error || !user) {
+  if (!user) {
     return { success: false, error: "Credenciales inválidas." }
   }
 

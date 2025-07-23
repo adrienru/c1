@@ -1,7 +1,7 @@
 "use server"
 
 import { revalidatePath } from "next/cache"
-import { supabase } from "@/lib/supabase"
+import { passwordOperations, twoFactorOperations } from "@/lib/db-operations"
 import { encryptPassword, decryptPassword } from "@/lib/encryption"
 import { deleteSession, getUserIdFromSession } from "@/lib/session"
 import { redirect } from "next/navigation"
@@ -17,37 +17,24 @@ export async function addPassword(serviceName: string, username: string, passwor
     return { success: false, error: "Todos los campos son requeridos." }
   }
 
-  const encryptedPassword = encryptPassword(passwordPlain)
-
-  const { error } = await supabase.from("passwords").insert({
-    user_id: userId,
-    service_name: serviceName,
-    username: username,
-    encrypted_password: encryptedPassword,
-  })
-
-  if (error) {
+  try {
+    const encryptedPassword = encryptPassword(passwordPlain)
+    passwordOperations.create(userId, serviceName, username, encryptedPassword)
+    revalidatePath("/dashboard")
+    return { success: true }
+  } catch (error: any) {
     console.error("Error al añadir contraseña:", error)
     return { success: false, error: error.message || "Error al añadir contraseña." }
   }
-
-  revalidatePath("/dashboard")
-  return { success: true }
 }
 
 export async function getPasswords(userId: string) {
-  const { data, error } = await supabase
-    .from("passwords")
-    .select("id, service_name, username, created_at, encrypted_password")
-    .eq("user_id", userId)
-    .order("created_at", { ascending: false })
-
-  if (error) {
+  try {
+    return passwordOperations.findByUserId(userId)
+  } catch (error) {
     console.error("Error al obtener contraseñas:", error)
     return []
   }
-
-  return data
 }
 
 export async function deletePassword(passwordId: string) {
@@ -56,15 +43,14 @@ export async function deletePassword(passwordId: string) {
     return { success: false, error: "No autenticado." }
   }
 
-  const { error } = await supabase.from("passwords").delete().eq("id", passwordId).eq("user_id", userId)
-
-  if (error) {
+  try {
+    passwordOperations.delete(passwordId, userId)
+    revalidatePath("/dashboard")
+    return { success: true }
+  } catch (error: any) {
     console.error("Error al eliminar contraseña:", error)
     return { success: false, error: error.message || "Error al eliminar contraseña." }
   }
-
-  revalidatePath("/dashboard")
-  return { success: true }
 }
 
 export async function getDecryptedPassword(passwordId: string) {
@@ -73,22 +59,16 @@ export async function getDecryptedPassword(passwordId: string) {
     return { success: false, error: "No autenticado." }
   }
 
-  const { data: passwordEntry, error } = await supabase
-    .from("passwords")
-    .select("encrypted_password")
-    .eq("id", passwordId)
-    .eq("user_id", userId)
-    .single()
-
-  if (error || !passwordEntry) {
-    console.error("Error al obtener contraseña cifrada:", error)
-    return { success: false, error: error.message || "Contraseña no encontrada o no autorizada." }
-  }
-
   try {
+    const passwordEntry = passwordOperations.findById(passwordId, userId)
+    
+    if (!passwordEntry) {
+      return { success: false, error: "Contraseña no encontrada o no autorizada." }
+    }
+
     const decrypted = decryptPassword(passwordEntry.encrypted_password)
     return { success: true, password: decrypted }
-  } catch (decryptError) {
+  } catch (decryptError: any) {
     console.error("Error al descifrar contraseña:", decryptError)
     return { success: false, error: "Error al descifrar la contraseña." }
   }
@@ -105,70 +85,67 @@ export async function getSecurityAuditResults() {
     return { success: false, error: "No autenticado." }
   }
 
-  const { data: passwords, error } = await supabase
-    .from("passwords")
-    .select("encrypted_password, created_at")
-    .eq("user_id", userId)
+  try {
+    const passwords = passwordOperations.findByUserId(userId)
+    
+    let weakCount = 0
+    let reusedCount = 0
+    let oldCount = 0
+    const decryptedPasswords: string[] = []
+    const passwordOccurrences = new Map<string, number>()
 
-  if (error) {
+    const oneYearAgo = new Date()
+    oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1)
+
+    for (const p of passwords) {
+      try {
+        const decrypted = decryptPassword(p.encrypted_password)
+        decryptedPasswords.push(decrypted)
+
+        const hasUppercase = /[A-Z]/.test(decrypted)
+        const hasLowercase = /[a-z]/.test(decrypted)
+        const hasNumber = /[0-9]/.test(decrypted)
+        const hasSymbol = /[!@#$%^&*()-_=+]/.test(decrypted)
+
+        if (decrypted.length < 12 || !(hasUppercase && hasLowercase && hasNumber && hasSymbol)) {
+          weakCount++
+        }
+
+        const createdAtDate = new Date(p.created_at)
+        if (createdAtDate < oneYearAgo) {
+          oldCount++
+        }
+
+        passwordOccurrences.set(decrypted, (passwordOccurrences.get(decrypted) || 0) + 1)
+      } catch (e) {
+        console.error("Error decrypting password during audit:", e)
+      }
+    }
+
+    passwordOccurrences.forEach((count) => {
+      if (count > 1) {
+        reusedCount += count - 1
+      }
+    })
+
+    let score = 100
+    score -= weakCount * 5
+    score -= reusedCount * 10
+    score -= oldCount * 3
+
+    score = Math.max(0, score)
+
+    return {
+      success: true,
+      score,
+      weakCount,
+      reusedCount,
+      oldCount,
+      totalPasswords: passwords.length,
+    }
+  } catch (error: any) {
     console.error("Error fetching passwords for audit:", error)
     return { success: false, error: error.message || "Error al obtener contraseñas para auditoría." }
-  }
-
-  let weakCount = 0
-  let reusedCount = 0
-  let oldCount = 0
-  const decryptedPasswords: string[] = []
-  const passwordOccurrences = new Map<string, number>()
-
-  const oneYearAgo = new Date()
-  oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1)
-
-  for (const p of passwords) {
-    try {
-      const decrypted = decryptPassword(p.encrypted_password)
-      decryptedPasswords.push(decrypted)
-
-      const hasUppercase = /[A-Z]/.test(decrypted)
-      const hasLowercase = /[a-z]/.test(decrypted)
-      const hasNumber = /[0-9]/.test(decrypted)
-      const hasSymbol = /[!@#$%^&*()-_=+]/.test(decrypted)
-
-      if (decrypted.length < 12 || !(hasUppercase && hasLowercase && hasNumber && hasSymbol)) {
-        weakCount++
-      }
-
-      const createdAtDate = new Date(p.created_at)
-      if (createdAtDate < oneYearAgo) {
-        oldCount++
-      }
-
-      passwordOccurrences.set(decrypted, (passwordOccurrences.get(decrypted) || 0) + 1)
-    } catch (e) {
-      console.error("Error decrypting password during audit:", e)
-    }
-  }
-
-  passwordOccurrences.forEach((count) => {
-    if (count > 1) {
-      reusedCount += count - 1
-    }
-  })
-
-  let score = 100
-  score -= weakCount * 5
-  score -= reusedCount * 10
-  score -= oldCount * 3
-
-  score = Math.max(0, score)
-
-  return {
-    success: true,
-    score,
-    weakCount,
-    reusedCount,
-    oldCount,
-    totalPasswords: passwords.length,
   }
 }
 
@@ -188,17 +165,7 @@ export async function addTwoFactorAuthKey(serviceName: string, accountName: stri
     // Cifrar la clave secreta antes de guardarla
     const encryptedSecret = encryptPassword(secretKeyPlain)
 
-    const { error } = await supabase.from("two_factor_auth_keys").insert({
-      user_id: userId,
-      service_name: serviceName,
-      account_name: accountName,
-      encrypted_secret: encryptedSecret,
-    })
-
-    if (error) {
-      console.error("Error al añadir clave 2FA:", error)
-      return { success: false, error: error.message || "Error al añadir clave 2FA." }
-    }
+    twoFactorOperations.create(userId, serviceName, accountName, encryptedSecret)
 
     revalidatePath("/dashboard")
     return { success: true }
@@ -214,18 +181,13 @@ export async function getTwoFactorAuthKeys() {
     return { success: false, error: "No autenticado." }
   }
 
-  const { data, error } = await supabase
-    .from("two_factor_auth_keys")
-    .select("id, service_name, account_name, created_at, encrypted_secret")
-    .eq("user_id", userId)
-    .order("created_at", { ascending: false })
-
-  if (error) {
+  try {
+    const data = twoFactorOperations.findByUserId(userId)
+    return { success: true, data }
+  } catch (error: any) {
     console.error("Error al obtener claves 2FA:", error)
     return { success: false, error: error.message || "Error al obtener claves 2FA." }
   }
-
-  return { success: true, data }
 }
 
 export async function deleteTwoFactorAuthKey(keyId: string) {
@@ -234,15 +196,14 @@ export async function deleteTwoFactorAuthKey(keyId: string) {
     return { success: false, error: "No autenticado." }
   }
 
-  const { error } = await supabase.from("two_factor_auth_keys").delete().eq("id", keyId).eq("user_id", userId)
-
-  if (error) {
+  try {
+    twoFactorOperations.delete(keyId, userId)
+    revalidatePath("/dashboard")
+    return { success: true }
+  } catch (error: any) {
     console.error("Error al eliminar clave 2FA:", error)
     return { success: false, error: error.message || "Error al eliminar clave 2FA." }
   }
-
-  revalidatePath("/dashboard")
-  return { success: true }
 }
 
 export async function generateTotpCode(keyId: string) {
@@ -251,19 +212,13 @@ export async function generateTotpCode(keyId: string) {
     return { success: false, error: "No autenticado." }
   }
 
-  const { data: keyEntry, error } = await supabase
-    .from("two_factor_auth_keys")
-    .select("encrypted_secret")
-    .eq("id", keyId)
-    .eq("user_id", userId)
-    .single()
-
-  if (error || !keyEntry) {
-    console.error("Error al obtener clave secreta 2FA cifrada:", error)
-    return { success: false, error: error.message || "Clave 2FA no encontrada o no autorizada." }
-  }
-
   try {
+    const keyEntry = twoFactorOperations.findById(keyId, userId)
+    
+    if (!keyEntry) {
+      return { success: false, error: "Clave 2FA no encontrada o no autorizada." }
+    }
+
     const decryptedSecret = decryptPassword(keyEntry.encrypted_secret)
     // Generar el código TOTP
     const token = authenticator.generate(decryptedSecret)
