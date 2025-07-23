@@ -1,3 +1,4 @@
+import "server-only";
 import { db } from './database';
 
 // Operaciones de usuarios
