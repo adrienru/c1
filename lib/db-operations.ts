@@ -94,3 +94,4 @@ export const twoFactorOperations = {
     const stmt = db.prepare('DELETE FROM two_factor_auth_keys WHERE id = ? AND user_id = ?');
     return stmt.run(id, userId);
   }
+}
